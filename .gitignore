@@ -1,0 +1,26 @@
+# Secrets — never commit (.env.example is tracked as a template)
+.env
+
+# Serena MCP tooling cache
+.serena/
+
+# macOS
+.DS_Store
+
+# Python / uv virtual env + caches
+.venv/
+__pycache__/
+*.pyc
+
+# Node — package.json is just a task-runner shortcut, no real deps
+node_modules/
+
+# Repair-manual PDFs — large binaries, kept local-only (drop them in docs/)
+docs/*.pdf
+
+# LEANN index artifacts — regenerable from the PDFs
+.leann/
+indexes/
+
+# Vendored LEANN source (cloned for its multimodal apps/ modules)
+vendor/

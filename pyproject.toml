@@ -1,0 +1,29 @@
+[project]
+name = "e30-rag"
+version = "0.1.0"
+description = "Local RAG over BMW E30 repair manuals (Bentley + factory) using LEANN"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "leann",
+    # ColQwen multimodal retrieval (vision embeddings of PDF pages)
+    "colpali-engine",
+    # LEANN's ColQwen path rejects transformers >=5.0 (HybridCache API removals),
+    # while colpali-engine needs >=4.46.1. Pin the working window.
+    "transformers>=4.46.1,<5",
+    "qwen-vl-utils",
+    "einops",
+    "torchvision",
+    # PDF handling: pymupdf renders pages (no poppler); pdf2image is only imported
+    # by apps.colqwen_rag at module load (we never call its poppler code path).
+    "pymupdf",
+    "pdf2image",
+    "pillow",
+    # Answer generation from retrieved page images (Anthropic vision LLM)
+    "anthropic",
+    "tqdm",
+]
+
+[tool.uv]
+package = false

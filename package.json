@@ -1,0 +1,14 @@
+{
+  "name": "e30-rag",
+  "version": "1.0.0",
+  "private": true,
+  "description": "shortcut commands for the e30 rag cli (see README)",
+  "license": "MIT",
+  "scripts": {
+    "build": "uv run python e30_rag.py build",
+    "ask": "uv run python e30_rag.py ask",
+    "chat": "uv run python e30_rag.py ask",
+    "ask:claude": "uv run python e30_rag.py ask --provider anthropic",
+    "ask:7b": "uv run python e30_rag.py ask --llm-model Qwen/Qwen2.5-VL-7B-Instruct"
+  }
+}
