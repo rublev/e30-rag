@@ -117,7 +117,7 @@ interactive (run `ask` with no question):
     --docs DIR      folder of pdfs (default: docs/)
     --index NAME    name for the index (default: e30)
     --model M       retrieval model, colqwen2 (default) or colpali
-    --dpi N         page render dpi (default: 150, higher just wastes time)
+    --dpi N         page render dpi (default: 120, keeps spec tables legible; higher just wastes time)
 
 `ask` (query it):
 
@@ -125,7 +125,14 @@ interactive (run `ask` with no question):
     --llm-model M   answer model. default is Qwen/Qwen2.5-VL-3B-Instruct for local
                     and claude-sonnet-4-6 for anthropic. e.g. Qwen/Qwen2.5-VL-7B-Instruct
                     locally if you have the ram, or claude-opus-4-7 for the best claude answers
-    --top-k N       how many manual pages to retrieve (default: 5)
+    --max-k N       most pages to send the answer model (default: 8). by default the
+                    count is dynamic: it keeps the best-matching page plus any others
+                    scoring close to it, so a specific question uses few pages and a
+                    broad one uses more (up to this cap)
+    --min-k N       fewest pages to send when going dynamic (default: 3)
+    --keep-ratio R  keep pages scoring >= R x the top page's score (default: 0.9;
+                    lower = more pages, higher = stricter)
+    --top-k N       force exactly N pages, turning the dynamic behavior off
     --index NAME    which index to query (default: e30)
     --model M       retrieval model, must match what you built with (default: colqwen2)
 
@@ -143,6 +150,12 @@ a spot for your vin, look it up on realoem.com and copy the decoded specs in.
   fits comfortably on a 32gb mac. the 7b is better but wants a lot more ram (it swaps
   hard on 32gb), so it's opt-in: `--llm-model Qwen/Qwen2.5-VL-7B-Instruct`.
 - local mode needs no api key. claude mode reads `ANTHROPIC_API_KEY` from `.env`.
+- accuracy vs privacy: the local 3b is fine for offline/private use, but on dense spec
+  tables it can misread the fine print (small numbers like bore/stroke, torque, wheel
+  sizes) and occasionally invent a value. for spec-critical lookups use `--provider
+  anthropic` — claude reads the fine print far more reliably — or the local 7b, which is
+  noticeably better at tables than the 3b (at the ram cost above). retrieval is the same
+  either way; it's only the answer model that differs.
 - the leann text cli also gets installed if you ever want plain-text rag over ocr'd
   docs; this project uses the image path instead.
 
