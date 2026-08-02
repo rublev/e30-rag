@@ -17,7 +17,7 @@ The local path needs no API key. For --provider anthropic, the key is read from
 a local `.env` (gitignored). See `.env.example`.
 
 Usage:
-    uv run python e30_rag.py build                      # index docs/*.pdf
+    uv run python e30_rag.py build                      # index docs/*.pdf (incremental: only new/changed)
     uv run python e30_rag.py ask "remove the rear wheel bearing"          # local Qwen
     uv run python e30_rag.py ask --provider anthropic "..."               # use Claude
     uv run python e30_rag.py ask --max-k 12 "..."                         # allow more pages (dynamic-k)
@@ -101,6 +101,114 @@ def _page_image_path(index: str, doc_id: int) -> Path:
     return _images_dir(index) / f"doc_{doc_id}.png"
 
 
+def _sources_path(index: str) -> Path:
+    """Manifest of indexed PDFs: content hash + assigned doc_id range per file.
+
+    This is what makes builds incremental — it's the only record of *which* PDFs
+    (and which exact bytes) are already in the index.
+    """
+    return INDEX_DIR / f"{index}.sources.json"
+
+
+def _labels_path(index: str) -> Path:
+    return INDEX_DIR / f"{index}.labels.json"
+
+
+def _emb_path(index: str) -> Path:
+    return INDEX_DIR / f"{index}.emb.npy"
+
+
+def _meta_path(index: str) -> Path:
+    return INDEX_DIR / f"{index}.meta.json"
+
+
+def _file_sha256(path: Path) -> str:
+    """Stream a file's SHA-256 so we detect content edits without trusting mtimes.
+
+    Chunked so a few-hundred-MB manual never lands in RAM all at once.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_json_atomic(path: Path, obj) -> None:
+    """Write JSON via a temp file + os.replace so a crash can't truncate the file."""
+    tmp = path.parent / (path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def _save_npy_atomic(path: Path, arr) -> None:
+    """np.save via a temp file + os.replace (atomic within the same directory).
+
+    We hand np.save an open file object because, given a path that doesn't end in
+    '.npy' (our '<name>.npy.tmp'), it would otherwise append a second '.npy'.
+    """
+    import numpy as np
+
+    tmp = path.parent / (path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        np.save(fh, arr)
+    os.replace(tmp, path)
+
+
+def _meta_dict(model: str, dim: int) -> dict:
+    """Sidecar meta matching LeannMultiVector's schema (ask reads 'dimensions')."""
+    return {
+        "version": "1.0",
+        "backend_name": "hnsw",
+        "embedding_model": model,
+        "embedding_mode": "custom",
+        "dimensions": dim,
+        "backend_kwargs": {
+            "distance_metric": "mips",
+            "M": 16,
+            "efConstruction": 500,
+            "is_compact": False,
+            "is_recompute": False,
+        },
+        "is_compact": False,
+        "is_pruned": False,
+    }
+
+
+def _load_manifest(index: str) -> dict | None:
+    path = _sources_path(index)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _reset_index(index: str) -> None:
+    """Delete every persisted artifact for this index (for a clean full rebuild).
+
+    Covers the incremental sidecars we own plus the FAISS ANN files a legacy
+    (pre-incremental) build may have left behind.
+    """
+    images_dir = _images_dir(index)
+    if images_dir.exists():
+        shutil.rmtree(images_dir)
+    for p in (
+        _emb_path(index),
+        _labels_path(index),
+        _meta_path(index),
+        _sources_path(index),
+        INDEX_DIR / f"{index}.index",
+        INDEX_DIR / f"{index}.ids.txt",
+    ):
+        if p.exists():
+            p.unlink()
+
+
 def _render_pdf_pages(pdf_path: str, dpi: int):
     """Render every page of a PDF to a PIL image using PyMuPDF (fitz).
 
@@ -149,74 +257,238 @@ def _embed_query(colqwen, text: str):
 
 
 def cmd_build(args) -> None:
+    """Incrementally (re)build the page-image index from docs/*.pdf.
+
+    Only PDFs that are new or whose bytes changed since the last build are
+    rendered + embedded (the expensive GPU step). Unchanged PDFs are skipped and
+    their existing vectors reused; PDFs removed from docs/ have their vectors and
+    page images pruned. Change detection is by SHA-256 of the PDF, tracked in
+    <index>.sources.json.
+
+    Retrieval (`ask`) scores exact MaxSim over <index>.emb.npy, so we maintain
+    only what that path reads — <index>.emb.npy, .labels.json, .meta.json and the
+    page PNGs — and do NOT rebuild the FAISS HNSW ANN index (unused here, and the
+    slow part of a from-scratch build).
+    """
     _setup_import_paths()
     _silence_deps()
     import fitz  # PyMuPDF — cheap page-count pass for the progress bar
+    import numpy as np
     from tqdm import tqdm
-    from apps.colqwen_rag import ColQwenRAG  # loads torch/pdf2image; model loads in __init__
-    from leann_multi_vector import LeannMultiVector
 
     docs_dir = Path(args.docs)
     pdfs = sorted(docs_dir.glob("*.pdf"))
     if not pdfs:
         sys.exit(f"No PDFs found in {docs_dir}/. Drop your manuals there and re-run.")
 
-    # Cheap page counts (no rendering) so the progress bar has a total + ETA.
-    page_counts = {}
-    for pdf in pdfs:
-        d = fitz.open(str(pdf))
-        page_counts[pdf] = d.page_count
-        d.close()
-    total_pages = sum(page_counts.values())
-    print(f"Found {len(pdfs)} PDF(s), {total_pages} pages total, rendering at {args.dpi} DPI:")
-    for pdf in pdfs:
-        print(f"  {pdf.name}: {page_counts[pdf]} pages")
-
-    print(f"Loading {args.model} (uses cached weights after the first run)...")
-    with contextlib.redirect_stdout(io.StringIO()):
-        colqwen = ColQwenRAG(args.model)
-
-    # Fresh rebuild: clear this index's persisted page images (regenerable).
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    index_path = str(INDEX_DIR / args.index)
-    images_dir = _images_dir(args.index)
-    if images_dir.exists():
-        shutil.rmtree(images_dir)
-    images_dir.mkdir(parents=True, exist_ok=True)
+    emb_path, labels_path = _emb_path(args.index), _labels_path(args.index)
 
-    mv = LeannMultiVector(index_path=index_path, dim=128, embedding_model_name=args.model)
-    mv.create_collection()
+    # --- Load the prior manifest; invalidate it if it can't be trusted. ---
+    manifest = _load_manifest(args.index)
+    if manifest is not None and (
+        manifest.get("model") != args.model
+        or int(manifest.get("dpi", -1)) != int(args.dpi)
+    ):
+        print(
+            f"Existing index was built with model={manifest.get('model')} "
+            f"dpi={manifest.get('dpi')}; you asked for model={args.model} dpi={args.dpi}. "
+            "Those change every embedding — rebuilding the whole index."
+        )
+        manifest = None
 
-    # Stream: render -> save page image to disk -> embed -> insert vectors only.
-    # We save images ourselves and pass image=None so full-res PIL pages are NOT
-    # held in RAM (LeannMultiVector otherwise keeps every page image in memory
-    # until create_index — ~20GB at high DPI). ask() loads pages back by path.
-    doc_id, dim = 0, None
-    with tqdm(total=total_pages, desc="Embedding pages", unit="pg") as pbar:
-        for pdf in pdfs:
-            for page_no, img in _render_pdf_pages(str(pdf), dpi=args.dpi):
-                img.save(_page_image_path(args.index, doc_id), "PNG")
-                vecs = _embed_image(colqwen, img)  # (P, 128)
-                dim = vecs.shape[-1]
-                mv.insert(
-                    {
-                        "doc_id": doc_id,
-                        "filepath": f"{pdf.stem} — p.{page_no}",  # returned by get_metadata()
-                        "colbert_vecs": vecs,
-                        "image": None,  # already saved to disk; keep it out of RAM
-                    }
-                )
-                doc_id += 1
-                pbar.update(1)
-                pbar.set_postfix_str(f"{pdf.stem} p.{page_no}")
-                del img
+    # Load + validate the survivor sidecars. Any inconsistency => clean rebuild.
+    old_labels: list[dict] = []
+    old_emb = None
+    if manifest is not None:
+        if emb_path.exists() and labels_path.exists():
+            old_labels = json.loads(labels_path.read_text(encoding="utf-8"))
+            old_emb = np.load(emb_path, mmap_mode="r")  # header-only; rows read on demand
+            if old_emb.shape[0] != len(old_labels):
+                print("Index sidecars are inconsistent (row mismatch) — rebuilding.")
+                manifest, old_labels, old_emb = None, [], None
+        else:
+            manifest = None  # manifest present but its data files are gone
 
-    if dim is not None:
-        mv.dim = dim  # ensure persisted meta matches real embedding dim
-    print(f"\nBuilding index from {doc_id} pages (writing to disk)...")
-    mv.create_index()
-    print(f"Done. Index written to {index_path}.* ({doc_id} pages).")
-    print('Ask with:  uv run python e30_rag.py ask "your question"')
+    if manifest is None:
+        # Fresh dir, invalidated index, or a legacy (pre-manifest) index: clean slate.
+        _reset_index(args.index)
+        prior_sources: dict = {}
+        next_doc_id = 0
+        dim: int | None = None
+        old_labels, old_emb = [], None
+    else:
+        prior_sources = manifest.get("sources", {})
+        next_doc_id = int(manifest.get("next_doc_id", 0))
+        dim = int(manifest["dim"]) if manifest.get("dim") else None
+
+    # --- Hash the current PDFs and diff against the manifest. ---
+    print(f"Scanning {len(pdfs)} PDF(s) in {docs_dir}/ ...")
+    current: dict[str, dict] = {
+        pdf.name: {"path": pdf, "sha256": _file_sha256(pdf), "size": pdf.stat().st_size}
+        for pdf in pdfs
+    }
+    new_names = sorted(n for n in current if n not in prior_sources)
+    changed_names = sorted(
+        n for n in current
+        if n in prior_sources and current[n]["sha256"] != prior_sources[n].get("sha256")
+    )
+    deleted_names = sorted(n for n in prior_sources if n not in current)
+    unchanged_names = sorted(
+        n for n in current
+        if n in prior_sources and current[n]["sha256"] == prior_sources[n].get("sha256")
+    )
+    to_embed = new_names + changed_names  # only these hit the GPU
+
+    # doc_ids to drop: a changed source's stale range + every deleted source's range.
+    retired_doc_ids: set[int] = set()
+    for n in changed_names + deleted_names:
+        s = prior_sources[n]
+        start = int(s["doc_id_start"])
+        retired_doc_ids.update(range(start, start + int(s["page_count"])))
+
+    def _fmt(names: list[str]) -> str:
+        return ", ".join(names) if names else "(none)"
+
+    print(f"  New:       {_fmt(new_names)}")
+    print(f"  Changed:   {_fmt(changed_names)}")
+    print(f"  Deleted:   {_fmt(deleted_names)}")
+    print(f"  Unchanged: {len(unchanged_names)} file(s), skipped")
+
+    if not to_embed and not retired_doc_ids:
+        print("Index is already up to date. Nothing to do.")
+        return
+
+    # --- Prune retired rows from the survivors (filters, never re-embeds). ---
+    if old_emb is not None and retired_doc_ids:
+        keep = [
+            i for i, row in enumerate(old_labels)
+            if int(row["doc_id"]) not in retired_doc_ids
+        ]
+        kept_labels = [old_labels[i] for i in keep]
+        kept_emb = old_emb[keep] if keep else None  # fancy-index a memmap -> RAM copy of kept rows only
+    else:
+        kept_labels = old_labels
+        kept_emb = old_emb  # memmap (or None); materialized by the vstack below
+
+    # --- Embed new/changed sources; carry unchanged sources forward untouched. ---
+    updated_sources: dict = {n: prior_sources[n] for n in unchanged_names}
+    new_labels: list[dict] = []
+    new_emb_parts: list = []
+
+    if to_embed:
+        page_counts = {}
+        for n in to_embed:
+            d = fitz.open(str(current[n]["path"]))
+            page_counts[n] = d.page_count
+            d.close()
+        total_pages = sum(page_counts.values())
+        print(
+            f"Embedding {len(to_embed)} file(s), {total_pages} pages at {args.dpi} DPI "
+            f"(reusing {len(unchanged_names)} unchanged):"
+        )
+        for n in to_embed:
+            print(f"  {n}: {page_counts[n]} pages")
+
+        print(f"Loading {args.model} (uses cached weights after the first run)...")
+        from apps.colqwen_rag import ColQwenRAG  # pulls torch; only needed to embed
+        with contextlib.redirect_stdout(io.StringIO()):
+            colqwen = ColQwenRAG(args.model)
+
+        _images_dir(args.index).mkdir(parents=True, exist_ok=True)
+
+        # Stream: render -> save page PNG to disk -> embed -> keep vectors only.
+        # Images go straight to disk (ask() reloads them by path) so full-res pages
+        # never pile up in RAM. New/changed docs get fresh, monotonic doc_ids that
+        # are never reused, so survivor rows and their PNG names stay valid.
+        with tqdm(total=total_pages, desc="Embedding pages", unit="pg") as pbar:
+            for n in to_embed:
+                pdf = current[n]["path"]
+                start_doc_id = next_doc_id
+                pages = 0
+                for page_no, img in _render_pdf_pages(str(pdf), dpi=args.dpi):
+                    img.save(_page_image_path(args.index, next_doc_id), "PNG")
+                    vecs = _embed_image(colqwen, img)  # (P, dim)
+                    if dim is None:
+                        dim = int(vecs.shape[-1])
+                    img_path = str(_page_image_path(args.index, next_doc_id))
+                    for seq_id, vec in enumerate(vecs):
+                        new_emb_parts.append(np.asarray(vec, dtype=np.float32))
+                        new_labels.append(
+                            {
+                                "id": f"{next_doc_id}:{seq_id}",
+                                "doc_id": next_doc_id,
+                                "seq_id": int(seq_id),
+                                "filepath": f"{pdf.stem} — p.{page_no}",
+                                "image_path": img_path,
+                            }
+                        )
+                    next_doc_id += 1
+                    pages += 1
+                    pbar.update(1)
+                    pbar.set_postfix_str(f"{pdf.stem} p.{page_no}")
+                    del img
+                updated_sources[n] = {
+                    "sha256": current[n]["sha256"],
+                    "size": current[n]["size"],
+                    "page_count": pages,
+                    "doc_id_start": start_doc_id,
+                }
+
+    # --- Assemble the final matrix + labels (survivors first, then new rows). ---
+    new_emb = np.vstack(new_emb_parts) if new_emb_parts else None
+    if kept_emb is not None and new_emb is not None:
+        final_emb = np.vstack([np.asarray(kept_emb), new_emb])
+    elif new_emb is not None:
+        final_emb = new_emb
+    elif kept_emb is not None:
+        final_emb = np.asarray(kept_emb)
+    else:
+        final_emb = None
+    final_labels = kept_labels + new_labels
+
+    if final_emb is None or final_emb.shape[0] == 0:
+        sys.exit("Refusing to write an empty index (no pages remain); left it untouched.")
+    if final_emb.shape[0] != len(final_labels):
+        sys.exit(
+            f"Internal error: {final_emb.shape[0]} vectors vs {len(final_labels)} labels; "
+            "aborted without touching the existing index."
+        )
+    if dim is None:
+        dim = int(final_emb.shape[1])
+
+    # --- Commit: atomic sidecar writes so a crash can't leave a half-updated index. ---
+    _save_npy_atomic(emb_path, final_emb.astype(np.float32, copy=False))
+    _write_json_atomic(labels_path, final_labels)
+    _write_json_atomic(_meta_path(args.index), _meta_dict(args.model, dim))
+    _write_json_atomic(
+        _sources_path(args.index),
+        {
+            "version": 1,
+            "model": args.model,
+            "dpi": int(args.dpi),
+            "dim": int(dim),
+            "next_doc_id": int(next_doc_id),
+            "sources": updated_sources,
+        },
+    )
+
+    # --- Post-commit GC: only now drop pruned page images + any stale FAISS files. ---
+    for doc_id in retired_doc_ids:
+        img_file = _page_image_path(args.index, doc_id)
+        if img_file.exists():
+            img_file.unlink()
+    for stale in (INDEX_DIR / f"{args.index}.index", INDEX_DIR / f"{args.index}.ids.txt"):
+        if stale.exists():
+            stale.unlink()
+
+    total_pages_now = sum(int(s["page_count"]) for s in updated_sources.values())
+    print(
+        f"\nDone. Embedded {len(to_embed)} file(s), removed {len(deleted_names)}, "
+        f"reused {len(unchanged_names)}. Index now: {len(updated_sources)} file(s), "
+        f"{total_pages_now} pages, {final_emb.shape[0]} vectors -> {emb_path}"
+    )
+    print('Ask with:  pnpm ask "your question"')
 
 
 def _b64_jpeg(img, *, max_edge: int = 1568, quality: int = 85) -> str:
@@ -506,7 +778,10 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build", help="Build the page-image index from docs/*.pdf")
+    b = sub.add_parser(
+        "build",
+        help="Incrementally (re)build the index from docs/*.pdf (embeds only new/changed PDFs)",
+    )
     b.add_argument("--docs", default=str(DOCS), help="Directory of PDFs (default: docs/)")
     b.add_argument("--index", default="e30", help="Index name (default: e30)")
     b.add_argument("--model", choices=["colqwen2", "colpali"], default="colqwen2")
