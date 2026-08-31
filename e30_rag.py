@@ -743,9 +743,17 @@ def cmd_ask(args) -> None:
 
     if args.provider == "local":
         llm_model = args.llm_model or "Qwen/Qwen2.5-VL-7B-Instruct"
-        model, processor, device = _load_local_vlm(llm_model, quant="4bit" if args.llm_4bit else "8bit")
+        quant = "4bit" if args.llm_4bit else "8bit"
+        # Lazy-load the big VLM: in single-shot mode answer_one frees the ~4.5 GB
+        # retriever first (see free_retriever), so deferring the load until the first
+        # generate() keeps colqwen and the 8-bit VLM from ever being co-resident — that's
+        # what lets the 7B fit a 16 GB card. Cached in a dict so interactive loads once.
+        _vlm = {}
 
         def generate(question, pages):
+            if not _vlm:
+                _vlm["h"] = _load_local_vlm(llm_model, quant=quant)
+            model, processor, device = _vlm["h"]
             return _answer_local(model, processor, device, question, pages)
     else:
         llm_model = args.llm_model or "claude-sonnet-4-6"
