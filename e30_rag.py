@@ -631,8 +631,15 @@ def _answer_local(model, processor, device, question: str, pages) -> str:
     with torch.no_grad():
         # Greedy (do_sample=False): deterministic, reproducible answers for a factual
         # repair assistant, and it avoids the multinomial sampling path that crashes on
-        # any residual inf/nan in the logits.
-        generated = model.generate(**inputs, max_new_tokens=4096, do_sample=False)
+        # any residual inf/nan in the logits. repetition_penalty tames the greedy-decode
+        # loops that quantized VLMs fall into (e.g. counting "10Nm, 20Nm, 30Nm…" forever);
+        # 2048 new tokens is plenty for a page-grounded answer and caps any runaway.
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=2048,
+            do_sample=False,
+            repetition_penalty=1.15,
+        )
     trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated)]
     return processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
