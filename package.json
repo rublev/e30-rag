@@ -9,6 +9,6 @@
     "ask": "uv run python e30_rag.py ask",
     "chat": "uv run python e30_rag.py ask",
     "ask:claude": "uv run python e30_rag.py ask --provider anthropic",
-    "ask:7b": "uv run python e30_rag.py ask --llm-model Qwen/Qwen2.5-VL-7B-Instruct"
+    "ask:4bit": "uv run python e30_rag.py ask --llm-4bit"
   }
 }
