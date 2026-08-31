@@ -16,7 +16,8 @@ __pycache__/
 node_modules/
 
 # Repair-manual PDFs — large binaries, kept local-only (drop them in docs/)
-docs/*.pdf
+docs/*
+!docs/.gitkeep
 
 # LEANN index artifacts — regenerable from the PDFs
 .leann/

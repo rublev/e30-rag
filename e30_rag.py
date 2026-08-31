@@ -37,6 +37,21 @@ import sys
 from pathlib import Path
 from typing import Any, NamedTuple
 
+# --- transformers 4.53.x chat-template shim ------------------------------
+# vidore/colqwen2-v1.0 ships additional_chat_templates/sentence_transformers.jinja;
+# transformers 4.53.x mis-resolves it to None inside ProcessorMixin.from_pretrained
+# and crashes: TypeError: expected str, bytes or os.PathLike object, not NoneType.
+# ColQwen2/ColPali are retrieval encoders that never use a chat template, and we are
+# pinned to 4.53.x (colpali needs >=4.53.1, LEANN caps <4.54), so we disable the
+# spurious template discovery. Safe: no chat template is consumed at inference.
+try:
+    import transformers.processing_utils as _tf_processing_utils
+
+    _tf_processing_utils.list_repo_templates = lambda *a, **k: []
+except Exception:
+    pass
+# -------------------------------------------------------------------------
+
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "vendor" / "LEANN"
 MULTIVEC = VENDOR / "apps" / "multimodal" / "vision-based-pdf-multi-vector"
@@ -277,7 +292,7 @@ def cmd_build(args) -> None:
     from tqdm import tqdm
 
     docs_dir = Path(args.docs)
-    pdfs = sorted(docs_dir.glob("*.pdf"))
+    pdfs = sorted(docs_dir.rglob("*.pdf"))
     if not pdfs:
         sys.exit(f"No PDFs found in {docs_dir}/. Drop your manuals there and re-run.")
 
@@ -551,28 +566,52 @@ def _page_label(citation: str) -> dict:
     return {"type": "text", "text": f"[Manual page: {citation}]"}
 
 
-def _load_local_vlm(model_name: str):
+def _load_local_vlm(model_name: str, quant: str = "8bit"):
     """Load a local vision-language model for answer generation (once).
 
-    Uses AutoModelForImageTextToText so any Qwen2-VL / Qwen2.5-VL checkpoint (or
-    other compatible VLM) works via --llm-model. Runs on Apple-Silicon MPS if
-    available, else CUDA, else CPU. Returns (model, processor, device).
+    Uses AutoModelForImageTextToText so any Qwen2-VL / Qwen2.5-VL checkpoint works
+    via --llm-model. On CUDA the weights are loaded quantized via bitsandbytes so a
+    7B model fits alongside the colqwen retriever on a 16 GB card:
+      quant="8bit" (default) — ~8 GB, near-fp16 answer quality.
+      quant="4bit"           — ~5.5 GB (NF4), faster + more VRAM for large --max-k.
+    Apple-Silicon MPS / CPU have no bitsandbytes, so they load full precision.
+    Returns (model, processor, device).
     """
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
+    processor = AutoProcessor.from_pretrained(model_name)
+
+    if torch.cuda.is_available() and quant in ("8bit", "4bit"):
+        from transformers import BitsAndBytesConfig
+
+        if quant == "4bit":
+            qcfg = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+        else:
+            qcfg = BitsAndBytesConfig(load_in_8bit=True)
+        print(f"Loading local model {model_name} on cuda in {quant} (first run downloads weights)...")
+        # device_map places the quantized weights on the GPU; do NOT call .to() after.
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_name, quantization_config=qcfg, device_map={"": 0}
+        )
+        return model, processor, "cuda"
+
+    # No CUDA quantization path (Apple-Silicon MPS / CPU): full precision. torch_dtype
+    # (not dtype) is the kwarg transformers 4.53.x understands; bf16 on MPS avoids fp16
+    # inf/nan in the vision tower, fp32 on CPU.
     if torch.backends.mps.is_available():
-        # bfloat16, not float16: fp16's narrow exponent range overflows to inf/nan in
-        # Qwen2.5-VL's vision tower on MPS, which crashes generation with "probability
-        # tensor contains inf/nan". bf16 has fp32's exponent range and stays stable.
         device, dtype = "mps", torch.bfloat16
     elif torch.cuda.is_available():
         device, dtype = "cuda", torch.float16
     else:
         device, dtype = "cpu", torch.float32
     print(f"Loading local model {model_name} on {device} (first run downloads weights)...")
-    model = AutoModelForImageTextToText.from_pretrained(model_name, dtype=dtype).to(device)
-    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModelForImageTextToText.from_pretrained(model_name, torch_dtype=dtype).to(device)
     return model, processor, device
 
 
@@ -703,8 +742,8 @@ def cmd_ask(args) -> None:
     mv = LeannMultiVector(index_path=str(index_path), dim=dim, embedding_model_name=args.model)
 
     if args.provider == "local":
-        llm_model = args.llm_model or "Qwen/Qwen2.5-VL-3B-Instruct"
-        model, processor, device = _load_local_vlm(llm_model)
+        llm_model = args.llm_model or "Qwen/Qwen2.5-VL-7B-Instruct"
+        model, processor, device = _load_local_vlm(llm_model, quant="4bit" if args.llm_4bit else "8bit")
 
         def generate(question, pages):
             return _answer_local(model, processor, device, question, pages)
@@ -714,7 +753,7 @@ def cmd_ask(args) -> None:
         def generate(question, pages):
             return _answer_anthropic(question, pages, llm_model)
 
-    def answer_one(question: str) -> None:
+    def answer_one(question: str, free_retriever: bool = False) -> None:
         q_vecs = _embed_query(colqwen, question)  # (T, 128)
         # Exact MaxSim: every page is scored exactly (no ANN approximation);
         # search_exact_all returns the best max_k as the candidate pool, which
@@ -751,6 +790,16 @@ def cmd_ask(args) -> None:
         print(f"\nRetrieved {len(pages)} page(s) [{kind}, MaxSim-ranked]:")
         for page in pages:
             print(f"  [{page.score:7.2f}]  {page.citation}")
+        if free_retriever:
+            # Query's embedded and pages are retrieved, so the colqwen retriever (~4.5 GB)
+            # is dead weight during generation — drop it to CPU so the local VLM gets the
+            # whole card for the page-image prefill. Single-shot only; interactive keeps it
+            # resident to embed the next question.
+            import torch
+
+            if torch.cuda.is_available():
+                colqwen.model.to("cpu")
+                torch.cuda.empty_cache()
         answer = generate(question, pages)
         print("\n=== ANSWER ===\n" + answer)
         print("\n=== SOURCES (open these manual pages) ===")
@@ -758,7 +807,7 @@ def cmd_ask(args) -> None:
             print(f"  • {page.citation}")
 
     if args.question:
-        answer_one(" ".join(args.question))
+        answer_one(" ".join(args.question), free_retriever=(args.provider == "local"))
     else:
         print("Interactive mode. Ask about your E30; type 'quit' to exit.")
         while True:
@@ -802,8 +851,12 @@ def main() -> None:
     )
     a.add_argument(
         "--llm-model", default=None,
-        help="Answer model (default: Qwen/Qwen2.5-VL-3B-Instruct for local, claude-sonnet-4-6 for anthropic; "
-             "use Qwen/Qwen2.5-VL-7B-Instruct locally if you have the RAM)",
+        help="Answer model (default: Qwen/Qwen2.5-VL-7B-Instruct for local, claude-sonnet-4-6 for anthropic)",
+    )
+    a.add_argument(
+        "--llm-4bit", action="store_true",
+        help="Load the local VLM in 4-bit NF4 instead of the 8-bit default (~5.5 GB vs ~8 GB): "
+             "faster and leaves more VRAM for large --max-k, at a small quality cost.",
     )
     a.add_argument(
         "--top-k", type=int, default=None,

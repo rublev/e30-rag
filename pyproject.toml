@@ -11,7 +11,7 @@ dependencies = [
     "colpali-engine",
     # LEANN's ColQwen path rejects transformers >=5.0 (HybridCache API removals),
     # while colpali-engine needs >=4.46.1. Pin the working window.
-    "transformers>=4.46.1,<5",
+    "transformers>=4.46.1,<4.54",
     "qwen-vl-utils",
     "einops",
     "torchvision",
@@ -23,6 +23,7 @@ dependencies = [
     # Answer generation from retrieved page images (Anthropic vision LLM)
     "anthropic",
     "tqdm",
+    "bitsandbytes>=0.50.2",
 ]
 
 [tool.uv]
